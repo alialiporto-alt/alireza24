@@ -119,9 +119,9 @@ def admin_guard(fn):
 
 
 def main_kb():
+    # Student identity and exam code are collected in one continuous flow.
     return InlineKeyboardMarkup([
-      [InlineKeyboardButton('🎓 ورود با کد دانشجویی', callback_data='student_login')],
-      [InlineKeyboardButton('📝 شرکت در آزمون', callback_data='exam_enter')],
+      [InlineKeyboardButton('📝 ورود به آزمون', callback_data='exam_login')],
       [InlineKeyboardButton('📊 کارنامه من', callback_data='scores')],
       [InlineKeyboardButton('🔐 پنل مدیریت', callback_data='admin_login')]])
 
@@ -169,17 +169,20 @@ async def student_code_received(update, context):
         c.execute('UPDATE students SET code_used=1 WHERE id=? AND code_used=0', (student['id'],))
     # Student identity is kept only in the active bot session; no student Telegram ID is stored in the database.
     context.user_data['student_id'] = student['id']
-    await update.message.reply_text(f"✅ خوش آمدی {student['name']}!\nکد دانشجویی شما مصرف شد. حالا می‌توانید کد مشترک آزمون را وارد کنید.", reply_markup=main_kb())
-    return ConversationHandler.END
-
-
-async def exam_enter_start(update, context):
-    q = update.callback_query; await q.answer()
-    if not context.user_data.get('student_id'):
-        await q.message.reply_text('ابتدا با کد دانشجویی وارد شوید. پس از ورود، کد دانشجو یک‌بارمصرف می‌شود.')
-        return ConversationHandler.END
-    await q.message.reply_text('کد مشترک آزمون را وارد کنید:')
+    await update.message.reply_text(
+        f"✅ خوش آمدی {student['name']}!\nحالا کد درس/آزمون را وارد کنید:"
+    )
     return EXAM_CODE
+
+
+async def exam_login_start(update, context):
+    q = update.callback_query
+    await q.answer()
+    # Start a fresh student login flow; do not reuse a previous student's session.
+    context.user_data.pop('student_id', None)
+    context.user_data.pop('attempt_id', None)
+    await q.message.reply_text('ابتدا کد اختصاصی دانشجویی خود را وارد کنید:')
+    return STUDENT_CODE
 
 
 async def exam_code_received(update, context):
@@ -187,24 +190,24 @@ async def exam_code_received(update, context):
     student_id = context.user_data.get('student_id')
     if not student_id:
         await update.message.reply_text('نشست دانشجویی فعال نیست؛ با مدیر تماس بگیرید تا کد دانشجو را دوباره فعال کند.')
-        return ConversationHandler.END
+        return EXAM_CODE
     with db() as c:
         exam = c.execute('SELECT * FROM exams WHERE exam_code=?', (code,)).fetchone()
         if not exam or not exam['active']:
             await update.message.reply_text('❌ کد آزمون نامعتبر است یا آزمون غیرفعال شده است.')
-            return ConversationHandler.END
+            return EXAM_CODE
         t = now(); start_dt = datetime.fromisoformat(exam['starts_at']); end_dt = datetime.fromisoformat(exam['ends_at'])
         if t < start_dt or t > end_dt:
             await update.message.reply_text('⏰ آزمون هنوز شروع نشده یا مهلتش تمام شده است.')
-            return ConversationHandler.END
+            return EXAM_CODE
         existing = c.execute('SELECT id,status FROM attempts WHERE exam_id=? AND student_id=?', (exam['id'], student_id)).fetchone()
         if existing:
             await update.message.reply_text('⚠️ شما قبلاً در این آزمون شرکت کرده‌اید. برای تلاش مجدد باید مدیر تلاش قبلی را بازنشانی کند.')
-            return ConversationHandler.END
+            return EXAM_CODE
         questions = c.execute('SELECT * FROM questions WHERE exam_id=? ORDER BY position,id', (exam['id'],)).fetchall()
         if not questions:
             await update.message.reply_text('این آزمون هنوز سؤالی ندارد.')
-            return ConversationHandler.END
+            return EXAM_CODE
         cur = c.execute('INSERT INTO attempts(exam_id,student_id,started_at) VALUES(?,?,?)', (exam['id'], student_id, stamp(t)))
         attempt_id = cur.lastrowid
     context.user_data.update({'attempt_id': attempt_id, 'exam_id': exam['id'], 'questions': [dict(x) for x in questions], 'q_index': 0,
@@ -741,8 +744,18 @@ def main():
     app.add_handler(CommandHandler('start',start))
     app.add_handler(CommandHandler('cancel',cancel))
 
-    app.add_handler(ConversationHandler(entry_points=[CallbackQueryHandler(student_login_start,pattern='^student_login$')],states={STUDENT_CODE:[MessageHandler(filters.TEXT & ~filters.COMMAND,student_code_received)]},fallbacks=[CommandHandler('cancel',cancel)],allow_reentry=True))
-    app.add_handler(ConversationHandler(entry_points=[CallbackQueryHandler(exam_enter_start,pattern='^exam_enter$')],states={EXAM_CODE:[MessageHandler(filters.TEXT & ~filters.COMMAND,exam_code_received)],Q_EXAM:[CallbackQueryHandler(answer_button,pattern='^(answer_|finish)')]},fallbacks=[CommandHandler('cancel',cancel)],allow_reentry=True))
+    app.add_handler(ConversationHandler(
+        entry_points=[CallbackQueryHandler(exam_login_start, pattern='^exam_login$')],
+        states={
+            STUDENT_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, student_code_received)],
+            EXAM_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, exam_code_received)],
+            Q_EXAM: [CallbackQueryHandler(answer_button, pattern=r'^(answer_|finish)')]
+        },
+        fallbacks=[CommandHandler('cancel', cancel)],
+        allow_reentry=True,
+        name='student_exam_flow',
+        persistent=False
+    ))
     app.add_handler(ConversationHandler(entry_points=[CallbackQueryHandler(admin_login_start,pattern='^admin_login$')],states={ADMIN_PASS:[MessageHandler(filters.TEXT & ~filters.COMMAND,admin_password)]},fallbacks=[CommandHandler('cancel',cancel)]))
     app.add_handler(ConversationHandler(entry_points=[CallbackQueryHandler(admin_bulk_start,pattern='^bulk$')],states={BULK_NAMES:[MessageHandler(filters.TEXT & ~filters.COMMAND,admin_bulk_save)]},fallbacks=[CommandHandler('cancel',cancel)]))
     app.add_handler(ConversationHandler(entry_points=[CallbackQueryHandler(student_edit_start,pattern='^edit_student$')],states={EDIT_CODE:[MessageHandler(filters.TEXT & ~filters.COMMAND,student_edit_code)],EDIT_NAME:[MessageHandler(filters.TEXT & ~filters.COMMAND,student_edit_name)]},fallbacks=[CommandHandler('cancel',cancel)]))
@@ -752,10 +765,21 @@ def main():
     app.add_handler(ConversationHandler(entry_points=[CallbackQueryHandler(new_exam_start,pattern='^new_exam$')],states={EXAM_TITLE:[MessageHandler(filters.TEXT & ~filters.COMMAND,new_exam_title)],EXAM_SHARED_CODE:[MessageHandler(filters.TEXT & ~filters.COMMAND,new_exam_shared_code)],EXAM_START:[MessageHandler(filters.TEXT & ~filters.COMMAND,new_exam_start_dt)],EXAM_END:[MessageHandler(filters.TEXT & ~filters.COMMAND,new_exam_end_dt)],EXAM_DURATION:[MessageHandler(filters.TEXT & ~filters.COMMAND,new_exam_duration)]},fallbacks=[CommandHandler('cancel',cancel)]))
     app.add_handler(ConversationHandler(entry_points=[CallbackQueryHandler(add_question_start,pattern='^add_question$')],states={Q_EXAM:[CallbackQueryHandler(question_exam_selected,pattern='^qexam_')],Q_TEXT:[MessageHandler(filters.TEXT & ~filters.COMMAND,question_text)],Q_TYPE:[MessageHandler(filters.TEXT & ~filters.COMMAND,question_type)],Q_OPTIONS:[MessageHandler(filters.TEXT & ~filters.COMMAND,question_options)],Q_ANSWER:[MessageHandler(filters.TEXT & ~filters.COMMAND,question_answer)],Q_POINTS:[MessageHandler(filters.TEXT & ~filters.COMMAND,question_points)]},fallbacks=[CommandHandler('cancel',cancel)]))
     app.add_handler(ConversationHandler(entry_points=[CommandHandler('grade',grade_start)],states={GRADE_VALUE:[MessageHandler(filters.TEXT & ~filters.COMMAND,grade_value)]},fallbacks=[CommandHandler('cancel',cancel)]))
-    app.add_handler(CallbackQueryHandler(manage_exams, pattern='^manage_exams$'))
+    # Exam-management callbacks have exact, non-overlapping patterns.
+    app.add_handler(CallbackQueryHandler(manage_exams, pattern=r'^manage_exams$'))
     app.add_handler(CallbackQueryHandler(delete_exam_confirm, pattern=r'^exam_delete_[0-9]+$'))
-    app.add_handler(CallbackQueryHandler(delete_exam_execute, pattern=r'^exam_delete_(yes_[0-9]+|no)$'))
-    app.add_handler(ConversationHandler(entry_points=[CallbackQueryHandler(edit_exam_choose, pattern=r'^exam_edit_[0-9]+$')], states={EDIT_EXAM_VALUE: [CallbackQueryHandler(edit_exam_field, pattern=r'^exam_field_(title|code|start|end|duration|active)$'), MessageHandler(filters.TEXT & ~filters.COMMAND, edit_exam_save)]}, fallbacks=[CommandHandler('cancel', cancel)], allow_reentry=True))
+    app.add_handler(CallbackQueryHandler(delete_exam_execute, pattern=r'^exam_delete_(?:yes_[0-9]+|no)$'))
+    app.add_handler(ConversationHandler(
+        entry_points=[CallbackQueryHandler(edit_exam_choose, pattern=r'^exam_edit_[0-9]+$')],
+        states={EDIT_EXAM_VALUE: [
+            CallbackQueryHandler(edit_exam_field, pattern=r'^exam_field_(?:title|code|start|end|duration|active)$'),
+            MessageHandler(filters.TEXT & ~filters.COMMAND, edit_exam_save)
+        ]},
+        fallbacks=[CommandHandler('cancel', cancel)],
+        allow_reentry=True,
+        name='admin_exam_edit',
+        persistent=False
+    ))
     app.add_handler(CallbackQueryHandler(scores,pattern='^scores$'))
     app.add_handler(CallbackQueryHandler(show_codes,pattern='^codes$'))
     app.add_handler(CallbackQueryHandler(show_results,pattern='^results$'))
