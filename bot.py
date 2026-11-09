@@ -135,6 +135,7 @@ def admin_kb():
       [InlineKeyboardButton('🧪 ساخت آزمون', callback_data='new_exam')],
       [InlineKeyboardButton('➕ افزودن سؤال', callback_data='add_question')],
       [InlineKeyboardButton('🔑 نمایش کدهای آزمون', callback_data='codes')],
+      [InlineKeyboardButton('👨‍🎓 نمایش کدهای دانش‌آموزان', callback_data='student_codes')],
       [InlineKeyboardButton('📊 نتایج و تصحیح تشریحی', callback_data='results')],
       [InlineKeyboardButton('🛠 تغییر یا حذف آزمون', callback_data='manage_exams')],
       [InlineKeyboardButton('🏠 منوی اصلی', callback_data='home')]])
@@ -196,10 +197,8 @@ async def exam_code_received(update, context):
         if not exam or not exam['active']:
             await update.message.reply_text('❌ کد آزمون نامعتبر است یا آزمون غیرفعال شده است.')
             return EXAM_CODE
-        t = now(); start_dt = datetime.fromisoformat(exam['starts_at']); end_dt = datetime.fromisoformat(exam['ends_at'])
-        if t < start_dt or t > end_dt:
-            await update.message.reply_text('⏰ آزمون هنوز شروع نشده یا مهلتش تمام شده است.')
-            return EXAM_CODE
+        # آزمون‌ها محدودیت تاریخ ندارند؛ فقط مدت‌زمان پاسخ‌گویی اعمال می‌شود.
+        t = now()
         existing = c.execute("SELECT id,status FROM attempts WHERE exam_id=? AND student_id=? AND status<>'cancelled'", (exam['id'], student_id)).fetchone()
         if existing:
             await update.message.reply_text('⚠️ شما قبلاً در این آزمون شرکت کرده‌اید. برای تلاش مجدد باید مدیر تلاش قبلی را بازنشانی کند.')
@@ -212,7 +211,7 @@ async def exam_code_received(update, context):
         cur = c.execute('INSERT INTO attempts(exam_id,student_id,started_at) VALUES(?,?,?)', (exam['id'], student_id, stamp(t)))
         attempt_id = cur.lastrowid
     context.user_data.update({'attempt_id': attempt_id, 'exam_id': exam['id'], 'questions': [dict(x) for x in questions], 'q_index': 0,
-                              'deadline': min(t.timestamp()+exam['duration_minutes']*60, end_dt.timestamp()), 'awaiting_essay': None})
+                              'deadline': t.timestamp()+exam['duration_minutes']*60, 'awaiting_essay': None})
     # Deadline job auto-submits even if the student sends no further messages.
     context.job_queue.run_once(exam_timeout, max(1, context.user_data['deadline']-t.timestamp()),
         data={'attempt_id': attempt_id, 'chat_id': update.effective_chat.id}, name=f'{EXAM_TIMEOUT_JOB}_{attempt_id}')
@@ -422,24 +421,7 @@ async def new_exam_shared_code(update, context):
         if c.execute('SELECT 1 FROM exams WHERE exam_code=?',(code,)).fetchone():
             await update.message.reply_text('این کد قبلاً برای آزمون دیگری ثبت شده؛ کد دیگری وارد کنید:'); return EXAM_SHARED_CODE
     context.user_data['new_exam']['exam_code']=code
-    await update.message.reply_text('زمان شروع را به شکل YYYY-MM-DD HH:MM وارد کنید:'); return EXAM_START
-
-
-@admin_guard
-async def new_exam_start_dt(update, context):
-    try: context.user_data['new_exam']['starts_at']=stamp(parse_dt(update.message.text))
-    except ValueError: await update.message.reply_text('فرمت اشتباه است؛ نمونه: 2026-11-20 09:00'); return EXAM_START
-    await update.message.reply_text('زمان پایان را به شکل YYYY-MM-DD HH:MM وارد کنید:'); return EXAM_END
-
-
-@admin_guard
-async def new_exam_end_dt(update, context):
-    try:
-        end=parse_dt(update.message.text); start_dt=datetime.fromisoformat(context.user_data['new_exam']['starts_at'])
-        if end<=start_dt: raise ValueError()
-        context.user_data['new_exam']['ends_at']=stamp(end)
-    except ValueError: await update.message.reply_text('زمان پایان باید بعد از شروع باشد. نمونه: 2026-11-20 12:00'); return EXAM_END
-    await update.message.reply_text('مدت آزمون به دقیقه را وارد کنید:'); return EXAM_DURATION
+    await update.message.reply_text('مدت آزمون به دقیقه را وارد کنید (۱ تا ۶۰۰):'); return EXAM_DURATION
 
 
 @admin_guard
@@ -449,9 +431,10 @@ async def new_exam_duration(update, context):
         if not 1<=minutes<=600: raise ValueError()
     except ValueError: await update.message.reply_text('عدد صحیح بین 1 تا 600 وارد کنید:'); return EXAM_DURATION
     d=context.user_data.pop('new_exam')
+    # ستون‌های تاریخ برای سازگاری با پایگاه‌داده‌های قدیمی نگه داشته شده‌اند؛ در منطق آزمون استفاده نمی‌شوند.
     with db() as c: c.execute('INSERT INTO exams(title,exam_code,starts_at,ends_at,duration_minutes,created_at) VALUES(?,?,?,?,?,?)',
-        (d['title'],d['exam_code'],d['starts_at'],d['ends_at'],minutes,stamp()))
-    await update.message.reply_text(f"✅ آزمون ساخته شد.\nعنوان: {d['title']}\nکد مشترک: {d['exam_code']}\nهمه دانشجوها از همین کد استفاده می‌کنند.\nبرای افزودن سؤال از دکمه «افزودن سؤال» استفاده کنید.",reply_markup=admin_kb())
+        (d['title'],d['exam_code'],'2000-01-01T00:00:00+00:00','9999-12-31T23:59:59+00:00',minutes,stamp()))
+    await update.message.reply_text(f"✅ آزمون ساخته شد.\nعنوان: {d['title']}\nکد مشترک: {d['exam_code']}\nمدت: {minutes} دقیقه\nآزمون محدودیت تاریخ ندارد.",reply_markup=admin_kb())
     return ConversationHandler.END
 
 
@@ -554,9 +537,24 @@ async def reset_attempt_exam(update, context):
 @admin_guard
 async def show_codes(update, context):
     q=update.callback_query; await q.answer()
-    with db() as c: rows=c.execute('SELECT title,exam_code,starts_at,ends_at,active FROM exams ORDER BY id DESC').fetchall()
-    if not rows: await q.message.reply_text('هنوز آزمونی ثبت نشده است.'); return
-    await q.message.reply_text('🔑 کدهای مشترک آزمون:\n\n'+'\n'.join(f"{r['title']} | {r['exam_code']} | {r['starts_at']} تا {r['ends_at']} | {'فعال' if r['active'] else 'غیرفعال'}" for r in rows))
+    with db() as c: rows=c.execute('SELECT title,exam_code,active,duration_minutes FROM exams ORDER BY id DESC').fetchall()
+    if not rows: await q.message.reply_text('هنوز آزمونی ثبت نشده است.', reply_markup=admin_kb()); return
+    text='🔑 کدهای مشترک آزمون:\n\n'+'\n'.join(f"{r['title']} | {r['exam_code']} | مدت: {r['duration_minutes']} دقیقه | {'فعال' if r['active'] else 'غیرفعال'}" for r in rows)
+    for i in range(0, len(text), 3800):
+        await q.message.reply_text(text[i:i+3800], reply_markup=admin_kb() if i+3800>=len(text) else None)
+
+
+@admin_guard
+async def show_student_codes(update, context):
+    q=update.callback_query; await q.answer()
+    with db() as c: rows=c.execute('SELECT name,access_code,code_used FROM students ORDER BY name COLLATE NOCASE').fetchall()
+    if not rows:
+        await q.message.reply_text('هنوز کد دانش‌آموزی ثبت نشده است.', reply_markup=admin_kb()); return
+    lines=['👨‍🎓 کدهای دانش‌آموزان:','']
+    lines.extend(f"{r['name']} | {r['access_code']} | {'استفاده‌شده' if r['code_used'] else 'استفاده‌نشده'}" for r in rows)
+    text='\n'.join(lines)
+    for i in range(0, len(text), 3800):
+        await q.message.reply_text(text[i:i+3800], reply_markup=admin_kb() if i+3800>=len(text) else None)
 
 
 @admin_guard
@@ -610,7 +608,7 @@ async def manage_exams(update, context):
     q = update.callback_query
     await q.answer()
     with db() as c:
-        exams = c.execute('SELECT id,title,exam_code,starts_at,ends_at,active FROM exams ORDER BY id DESC').fetchall()
+        exams = c.execute('SELECT id,title,exam_code,duration_minutes,active FROM exams ORDER BY id DESC').fetchall()
     if not exams:
         await q.message.reply_text('هنوز آزمونی ثبت نشده است.', reply_markup=admin_kb())
         return
@@ -621,7 +619,7 @@ async def manage_exams(update, context):
             [InlineKeyboardButton('🗑 حذف آزمون', callback_data=f"exam_delete_{e['id']}")]
         ])
         await q.message.reply_text(
-            f"📘 {e['title']}\nکد: {e['exam_code']}\nشروع: {e['starts_at']}\nپایان: {e['ends_at']}\nوضعیت: {status}",
+            f"📘 {e['title']}\nکد: {e['exam_code']}\nمدت: {e['duration_minutes']} دقیقه\nوضعیت: {status}",
             reply_markup=kb)
 
 
@@ -638,7 +636,6 @@ async def edit_exam_choose(update, context):
     context.user_data['edit_exam_id'] = exam_id
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton('عنوان', callback_data='exam_field_title'), InlineKeyboardButton('کد آزمون', callback_data='exam_field_code')],
-        [InlineKeyboardButton('زمان شروع', callback_data='exam_field_start'), InlineKeyboardButton('زمان پایان', callback_data='exam_field_end')],
         [InlineKeyboardButton('مدت (دقیقه)', callback_data='exam_field_duration'), InlineKeyboardButton('فعال/غیرفعال', callback_data='exam_field_active')]
     ])
     await q.message.reply_text('کدام مشخصه را می‌خواهید تغییر دهید؟', reply_markup=kb)
@@ -654,8 +651,6 @@ async def edit_exam_field(update, context):
     prompts = {
         'title': 'عنوان جدید آزمون را وارد کنید:',
         'code': 'کد جدید آزمون را وارد کنید (حداقل ۳ نویسه):',
-        'start': 'زمان شروع جدید را وارد کنید (YYYY-MM-DD HH:MM):',
-        'end': 'زمان پایان جدید را وارد کنید (YYYY-MM-DD HH:MM):',
         'duration': 'مدت جدید آزمون را به دقیقه وارد کنید (۱ تا ۶۰۰):',
         'active': 'برای فعال‌سازی عدد ۱ و برای غیرفعال‌سازی عدد ۰ را وارد کنید:'
     }
@@ -668,7 +663,7 @@ async def edit_exam_save(update, context):
     value = update.message.text.strip()
     exam_id = context.user_data.get('edit_exam_id')
     field = context.user_data.get('edit_exam_field')
-    columns = {'title': 'title', 'code': 'exam_code', 'start': 'starts_at', 'end': 'ends_at', 'duration': 'duration_minutes', 'active': 'active'}
+    columns = {'title': 'title', 'code': 'exam_code', 'duration': 'duration_minutes', 'active': 'active'}
     try:
         with db() as c:
             exam = c.execute('SELECT * FROM exams WHERE id=?', (exam_id,)).fetchone()
@@ -682,12 +677,6 @@ async def edit_exam_save(update, context):
                 if len(new_value) < 3: raise ValueError('کد باید حداقل ۳ نویسه باشد.')
                 if c.execute('SELECT 1 FROM exams WHERE exam_code=? AND id<>?', (new_value, exam_id)).fetchone():
                     raise ValueError('این کد برای آزمون دیگری استفاده شده است.')
-            elif field in ('start', 'end'):
-                new_value = stamp(parse_dt(value))
-                other = datetime.fromisoformat(exam['ends_at' if field == 'start' else 'starts_at'])
-                current = datetime.fromisoformat(new_value)
-                if (field == 'start' and current >= other) or (field == 'end' and current <= other):
-                    raise ValueError('زمان شروع باید قبل از پایان باشد و زمان پایان بعد از شروع.')
             elif field == 'duration':
                 new_value = int(value)
                 if not 1 <= new_value <= 600: raise ValueError('مدت باید بین ۱ تا ۶۰۰ دقیقه باشد.')
@@ -752,7 +741,7 @@ async def interrupt_other_flows(update: Update, context: ContextTypes.DEFAULT_TY
     navigation = {
         'exam_login', 'scores', 'admin_login', 'bulk', 'edit_student',
         'delete_student', 'reactivate_student', 'reset_attempt', 'new_exam',
-        'add_question', 'codes', 'results', 'manage_exams', 'home'
+        'add_question', 'codes', 'student_codes', 'results', 'manage_exams', 'home'
     }
     is_exam_edit = data.startswith('exam_edit_') and data[len('exam_edit_'):].isdigit()
     if data not in navigation and not is_exam_edit:
@@ -814,7 +803,7 @@ def main():
     app.add_handler(ConversationHandler(entry_points=[CallbackQueryHandler(student_delete_start,pattern='^delete_student$')],states={DELETE_CODE:[MessageHandler(filters.TEXT & ~filters.COMMAND,student_delete_code)]},fallbacks=[CommandHandler('cancel',cancel)]))
     app.add_handler(ConversationHandler(entry_points=[CallbackQueryHandler(reactivate_student_start,pattern='^reactivate_student$')],states={EDIT_CODE:[MessageHandler(filters.TEXT & ~filters.COMMAND,reactivate_student_code)]},fallbacks=[CommandHandler('cancel',cancel)]))
     app.add_handler(ConversationHandler(entry_points=[CallbackQueryHandler(reset_attempt_start,pattern='^reset_attempt$')],states={DELETE_CODE:[MessageHandler(filters.TEXT & ~filters.COMMAND,reset_attempt_student)],EDIT_NAME:[MessageHandler(filters.TEXT & ~filters.COMMAND,reset_attempt_exam)]},fallbacks=[CommandHandler('cancel',cancel)]))
-    app.add_handler(ConversationHandler(entry_points=[CallbackQueryHandler(new_exam_start,pattern='^new_exam$')],states={EXAM_TITLE:[MessageHandler(filters.TEXT & ~filters.COMMAND,new_exam_title)],EXAM_SHARED_CODE:[MessageHandler(filters.TEXT & ~filters.COMMAND,new_exam_shared_code)],EXAM_START:[MessageHandler(filters.TEXT & ~filters.COMMAND,new_exam_start_dt)],EXAM_END:[MessageHandler(filters.TEXT & ~filters.COMMAND,new_exam_end_dt)],EXAM_DURATION:[MessageHandler(filters.TEXT & ~filters.COMMAND,new_exam_duration)]},fallbacks=[CommandHandler('cancel',cancel)]))
+    app.add_handler(ConversationHandler(entry_points=[CallbackQueryHandler(new_exam_start,pattern='^new_exam$')],states={EXAM_TITLE:[MessageHandler(filters.TEXT & ~filters.COMMAND,new_exam_title)],EXAM_SHARED_CODE:[MessageHandler(filters.TEXT & ~filters.COMMAND,new_exam_shared_code)],EXAM_DURATION:[MessageHandler(filters.TEXT & ~filters.COMMAND,new_exam_duration)]},fallbacks=[CommandHandler('cancel',cancel)]))
     app.add_handler(ConversationHandler(entry_points=[CallbackQueryHandler(add_question_start,pattern='^add_question$')],states={Q_EXAM:[CallbackQueryHandler(question_exam_selected,pattern='^qexam_')],Q_TEXT:[MessageHandler(filters.TEXT & ~filters.COMMAND,question_text)],Q_TYPE:[MessageHandler(filters.TEXT & ~filters.COMMAND,question_type)],Q_OPTIONS:[MessageHandler(filters.TEXT & ~filters.COMMAND,question_options)],Q_ANSWER:[MessageHandler(filters.TEXT & ~filters.COMMAND,question_answer)],Q_POINTS:[MessageHandler(filters.TEXT & ~filters.COMMAND,question_points)]},fallbacks=[CommandHandler('cancel',cancel)]))
     app.add_handler(ConversationHandler(entry_points=[CommandHandler('grade',grade_start)],states={GRADE_VALUE:[MessageHandler(filters.TEXT & ~filters.COMMAND,grade_value)]},fallbacks=[CommandHandler('cancel',cancel)]))
     # Exam-management callbacks have exact, non-overlapping patterns.
@@ -834,6 +823,7 @@ def main():
     ))
     app.add_handler(CallbackQueryHandler(scores,pattern='^scores$'))
     app.add_handler(CallbackQueryHandler(show_codes,pattern='^codes$'))
+    app.add_handler(CallbackQueryHandler(show_student_codes,pattern='^student_codes$'))
     app.add_handler(CallbackQueryHandler(show_results,pattern='^results$'))
     app.add_handler(CallbackQueryHandler(home,pattern='^home$'))
     # Essay answers are accepted only while an exam attempt is active.
