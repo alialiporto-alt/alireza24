@@ -200,7 +200,7 @@ async def exam_code_received(update, context):
         if t < start_dt or t > end_dt:
             await update.message.reply_text('⏰ آزمون هنوز شروع نشده یا مهلتش تمام شده است.')
             return EXAM_CODE
-        existing = c.execute('SELECT id,status FROM attempts WHERE exam_id=? AND student_id=?', (exam['id'], student_id)).fetchone()
+        existing = c.execute("SELECT id,status FROM attempts WHERE exam_id=? AND student_id=? AND status<>'cancelled'", (exam['id'], student_id)).fetchone()
         if existing:
             await update.message.reply_text('⚠️ شما قبلاً در این آزمون شرکت کرده‌اید. برای تلاش مجدد باید مدیر تلاش قبلی را بازنشانی کند.')
             return EXAM_CODE
@@ -208,6 +208,7 @@ async def exam_code_received(update, context):
         if not questions:
             await update.message.reply_text('این آزمون هنوز سؤالی ندارد.')
             return EXAM_CODE
+        c.execute("DELETE FROM attempts WHERE exam_id=? AND student_id=? AND status='cancelled'", (exam['id'], student_id))
         cur = c.execute('INSERT INTO attempts(exam_id,student_id,started_at) VALUES(?,?,?)', (exam['id'], student_id, stamp(t)))
         attempt_id = cur.lastrowid
     context.user_data.update({'attempt_id': attempt_id, 'exam_id': exam['id'], 'questions': [dict(x) for x in questions], 'q_index': 0,
@@ -732,6 +733,55 @@ async def delete_exam_execute(update, context):
     await q.message.reply_text('🗑 آزمون و سوابق مربوط به آن حذف شد.' if cur.rowcount else 'آزمون پیدا نشد.', reply_markup=admin_kb())
 
 
+async def interrupt_other_flows(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancel any in-progress conversation when the user chooses a different menu action."""
+    q = update.callback_query
+    if not q or not q.data:
+        return
+    data = q.data
+    # These callbacks are steps inside the current flow, not navigation to another flow.
+    internal = (
+        data.startswith(('answer_', 'qexam_', 'exam_field_', 'exam_delete_yes_', 'exam_delete_no'))
+        or data == 'finish'
+    )
+    if internal:
+        return
+
+    # A menu/action callback starts a different operation. End all PTB conversations
+    # for this chat/user before the selected entry point is processed.
+    navigation = {
+        'exam_login', 'scores', 'admin_login', 'bulk', 'edit_student',
+        'delete_student', 'reactivate_student', 'reset_attempt', 'new_exam',
+        'add_question', 'codes', 'results', 'manage_exams', 'home'
+    }
+    is_exam_edit = data.startswith('exam_edit_') and data[len('exam_edit_'):].isdigit()
+    if data not in navigation and not is_exam_edit:
+        return
+
+    key = (update.effective_chat.id, update.effective_user.id)
+    for handlers in context.application.handlers.values():
+        for handler in handlers:
+            if isinstance(handler, ConversationHandler):
+                # ConversationHandler currently exposes no public per-user cancel API.
+                handler._conversations.pop(key, None)
+
+    # If the user leaves an active exam, close it as cancelled while retaining
+    # already-saved answers. A cancelled attempt can be restarted on the next login.
+    aid = context.user_data.get('attempt_id')
+    if aid:
+        with db() as c:
+            score = c.execute('SELECT COALESCE(SUM(awarded_points),0) s FROM answers WHERE attempt_id=?', (aid,)).fetchone()['s']
+            c.execute("UPDATE attempts SET submitted_at=?, status='cancelled', score=? WHERE id=? AND status='in_progress'", (stamp(), score, aid))
+        for job in context.job_queue.get_jobs_by_name(f'{EXAM_TIMEOUT_JOB}_{aid}'):
+            job.schedule_removal()
+
+    # Clear only temporary flow data; keep the student's identity for the report menu.
+    keep = {'student_id'} if data == 'scores' else set()
+    for key_name in list(context.user_data.keys()):
+        if key_name not in keep:
+            context.user_data.pop(key_name, None)
+
+
 async def cancel(update, context):
     await update.message.reply_text('عملیات لغو شد.',reply_markup=main_kb()); return ConversationHandler.END
 
@@ -743,6 +793,8 @@ def main():
     app=Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler('start',start))
     app.add_handler(CommandHandler('cancel',cancel))
+    # Run before all ConversationHandlers so switching menu options cancels the old flow first.
+    app.add_handler(CallbackQueryHandler(interrupt_other_flows), group=-1)
 
     app.add_handler(ConversationHandler(
         entry_points=[CallbackQueryHandler(exam_login_start, pattern='^exam_login$')],
